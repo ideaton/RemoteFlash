@@ -7,7 +7,7 @@ Kept in its own module so the version string has a single source of truth
 
 # ─── App identity ──────────────────────────────────────────────────
 APP_NAME = "RemoteFlash"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 APP_TAGLINE = "Remote AVR flashing over SSH"
 APP_PUBLISHER = "IDEATON"
 APP_WEBSITE = "https://www.ideaton.pl"

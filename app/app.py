@@ -14,9 +14,10 @@ The application is split into focused modules:
     widgets.py         custom Tk widgets
     app.py             main window + updater (this file)
 
-Version: 1.2.1 · © IDEATON
+Version: 1.2.2 · © IDEATON
 """
 
+import json
 import os
 import re
 import sys
