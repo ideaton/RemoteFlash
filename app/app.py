@@ -1,695 +1,52 @@
 #!/usr/bin/env python3
 """
-RemoteFlash — Pure Python SSH/SFTP firmware flashing tool
-Cross-platform, no external C/Perl/OpenSSL dependencies (uses paramiko)
-Version: 1.1.0 · © IDEATON
+RemoteFlash — Pure Python SSH/SFTP firmware flashing tool.
+
+Cross-platform, no external C/Perl/OpenSSL dependencies (uses paramiko).
+The application is split into focused modules:
+
+    constants.py       app identity + auto-update source
+    theme.py           colour palette, fonts, ttk styles
+    models.py          enums + data classes
+    avr_signatures.py  AVR device-signature database
+    ssh_client.py      pure-Python SSH/SFTP client
+    config_manager.py  JSON config persistence
+    widgets.py         custom Tk widgets
+    app.py             main window + updater (this file)
+
+Version: 1.2.0 · © IDEATON
 """
 
-import tkinter as tk
-from tkinter import ttk, filedialog, scrolledtext, messagebox
-import threading
-import json
 import os
-from pathlib import Path
-from datetime import datetime
-from typing import Optional, List, Tuple
-import logging
-from enum import Enum
-from dataclasses import dataclass, asdict, field
-import socket
-import time
+import re
 import sys
+import time
+import threading
 import webbrowser
 import urllib.request
 from collections import deque
+from dataclasses import asdict
+from pathlib import Path
+from typing import List, Optional
 
-# Third-party imports
-import paramiko
-from paramiko.ssh_exception import (
-    NoValidConnectionsError,
-    AuthenticationException,
-    SSHException,
+import tkinter as tk
+from tkinter import ttk, filedialog, scrolledtext, messagebox
+
+import theme
+from theme import *  # colours + STEPS (fonts are read via theme.FONT_*)
+from constants import (
+    APP_NAME, APP_VERSION, APP_TAGLINE, APP_PUBLISHER,
+    APP_WEBSITE, APP_CONTACT, GITHUB_REPO, GITHUB_URL, GITHUB_API_LATEST,
 )
+from models import (
+    LogLevel, LogEntry, AuthMethod, ConnectionProfile, TaskState,
+)
+from avr_signatures import AVR_SIGNATURES
+from ssh_client import SSHClient
+from config_manager import ConfigManager
+from widgets import CollapsibleFrame, StepItem, SelectableList
 
-# ─── Theme palette ─────────────────────────────────────────────────
-# A cohesive modern light palette applied to every ttk widget below.
-BLUE_ACCENT = "#2563EB"   # primary accent
-BLUE_HOVER = "#1D4ED8"
-BLUE_PRESS = "#1E40AF"
-GREEN_OK = "#16A34A"
-GREEN_HOVER = "#15803D"
-GREEN_PRESS = "#166534"
-RED_ERR = "#DC2626"
-ORANGE_WARN = "#D97706"
 
-BG_DARK = "#F8F9FA"       # window background
-BG_CARD = "#FFFFFF"       # card / section background
-BG_CARD2 = "#F1F3F5"      # inset (entries, console)
-BG_HOVER = "#E9ECEF"      # hovered surface
-BORDER = "#DEE2E6"        # subtle separators / outlines
-BORDER_FOCUS = BLUE_ACCENT
-
-TEXT = "#212529"          # primary text
-TEXT_DIM = "#6C757D"      # secondary / muted text
-TEXT_HEADING = "#0F172A"
-
-# Fonts (family resolved at runtime against what's installed)
-FONT_FAMILY = "Segoe UI"
-FONT_MONO = "Cascadia Mono"
-FONT_BASE = (FONT_FAMILY, 10)
-FONT_BOLD = (FONT_FAMILY, 10, "bold")
-FONT_TITLE = (FONT_FAMILY, 19, "bold")
-FONT_SUBTITLE = (FONT_FAMILY, 10)
-FONT_SECTION = (FONT_FAMILY, 11, "bold")
-FONT_BTN = (FONT_FAMILY, 11, "bold")
-
-# Legacy filename kept on purpose: existing profiles survive the rename
-CONFIG_FILE = Path.home() / ".ssh_flasher_pro.json"
-
-# ─── App identity & auto-update source ─────────────────────────────
-APP_NAME = "RemoteFlash"
-APP_VERSION = "1.1.1"
-APP_TAGLINE = "Remote AVR flashing over SSH"
-APP_PUBLISHER = "IDEATON"
-APP_WEBSITE = "https://www.ideaton.pl"
-APP_CONTACT = "p.bayle@ideaton.pl"
-GITHUB_REPO = "ideaton/RemoteFlash"
-GITHUB_URL = f"https://github.com/{GITHUB_REPO}"
-GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-
-
-# ─── Enums and Data Classes ────────────────────────────────────────
-class LogLevel(Enum):
-    Info = "INFO"
-    Success = "SUCCESS"
-    Error = "ERROR"
-    Warning = "WARNING"
-    Debug = "DEBUG"
-    Command = "COMMAND"
-
-
-@dataclass
-class LogEntry:
-    level: LogLevel
-    message: str
-    timestamp: str
-
-    def __post_init__(self):
-        if not self.timestamp:
-            self.timestamp = self._current_time()
-
-    @staticmethod
-    def _current_time() -> str:
-        return datetime.now().strftime("%H:%M:%S")
-
-    def format_display(self) -> str:
-        icon = self._get_icon()
-        return f"[{self.timestamp}] {icon} {self.message}"
-
-    def _get_icon(self) -> str:
-        icons = {
-            LogLevel.Info: "ℹ",
-            LogLevel.Success: "✓",
-            LogLevel.Error: "✗",
-            LogLevel.Warning: "⚠",
-            LogLevel.Debug: "·",
-            LogLevel.Command: "›",
-        }
-        return icons.get(self.level, "·")
-
-
-class AuthMethod(Enum):
-    RsaKey = "key"
-    Password = "password"
-    Agent = "agent"
-
-
-@dataclass
-class ConnectionProfile:
-    name: str = "New profile"
-    ip: str = "192.168.1.1"
-    username: str = "root"
-    port: int = 22
-    auth_method: str = AuthMethod.RsaKey.value
-    rsa_key_path: Optional[str] = None
-    password: str = ""
-    port_labels: dict = field(default_factory=dict)  # Maps port paths to custom labels
-
-
-@dataclass
-class TaskState(Enum):
-    Idle = "idle"
-    Running = "running"
-    Done = "done"
-    Failed = "failed"
-
-
-# ─── Collapsible Frame ─────────────────────────────────────────────
-class CollapsibleFrame(ttk.Frame):
-    """A card-style frame with a clickable header that collapses/expands."""
-
-    def __init__(self, parent, title="", padding=12, **kwargs):
-        super().__init__(parent, style="Card.TFrame", **kwargs)
-        self.title = title
-        self.padding = padding
-        self.is_expanded = True
-
-        # Clickable header bar
-        self.header = ttk.Frame(self, style="CardHeader.TFrame", padding=(12, 9))
-        self.header.pack(fill="x", expand=False)
-
-        self.chevron = ttk.Label(self.header, text="▾", style="CardChevron.TLabel")
-        self.chevron.pack(side="left")
-        self.header_label = ttk.Label(self.header, text=title, style="CardHeader.TLabel")
-        self.header_label.pack(side="left", padx=(8, 0))
-
-        # Thin accent rule under the header
-        self.rule = ttk.Frame(self, style="Rule.TFrame", height=1)
-        self.rule.pack(fill="x")
-
-        # Content frame with padding
-        self.content_frame = ttk.Frame(self, style="Card.TFrame", padding=padding)
-        self.content_frame.pack(fill="both", expand=True)
-
-        for widget in (self.header, self.chevron, self.header_label):
-            widget.bind("<Button-1>", lambda _e: self._toggle())
-            widget.bind("<Enter>", lambda _e: self.header.configure(style="CardHeaderHover.TFrame"))
-            widget.bind("<Leave>", lambda _e: self.header.configure(style="CardHeader.TFrame"))
-
-    def _toggle(self):
-        """Toggle between expanded and collapsed states"""
-        self.is_expanded = not self.is_expanded
-        if self.is_expanded:
-            self.rule.pack(fill="x", after=self.header)
-            self.content_frame.pack(fill="both", expand=True)
-            self.chevron.config(text="▾")
-        else:
-            self.content_frame.pack_forget()
-            self.rule.pack_forget()
-            self.chevron.config(text="▸")
-
-    def get_content_frame(self):
-        """Return the frame where to place content"""
-        return self.content_frame
-
-
-# ─── SSH Handler ──────────────────────────────────────────────────
-class SSHClient:
-    """Pure-Python SSH client wrapper using paramiko"""
-
-    def __init__(self, timeout: int = 10):
-        self.timeout = timeout
-        self.client: Optional[paramiko.SSHClient] = None
-        self.sftp: Optional[paramiko.SFTPClient] = None
-
-    def connect(self, profile: ConnectionProfile) -> bool:
-        try:
-            self.client = paramiko.SSHClient()
-            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-            if profile.auth_method == AuthMethod.Password.value:
-                self.client.connect(
-                    hostname=profile.ip,
-                    port=profile.port,
-                    username=profile.username,
-                    password=profile.password,
-                    timeout=self.timeout,
-                )
-            elif profile.auth_method == AuthMethod.RsaKey.value:
-                if not profile.rsa_key_path or not Path(profile.rsa_key_path).exists():
-                    raise FileNotFoundError(f"RSA key not found: {profile.rsa_key_path}")
-
-                key_path = profile.rsa_key_path
-                if key_path.lower().endswith('.ppk'):
-                    key_path = self._handle_ppk_key(key_path)
-
-                self.client.connect(
-                    hostname=profile.ip,
-                    port=profile.port,
-                    username=profile.username,
-                    key_filename=key_path,
-                    timeout=self.timeout,
-                )
-            else:
-                raise ValueError(f"Unsupported auth method: {profile.auth_method}")
-
-            return True
-        except Exception as e:
-            raise ConnectionError(f"SSH connection failed: {e}")
-
-    def exec_command(self, command: str) -> Tuple[str, str, int]:
-        if not self.client:
-            raise RuntimeError("Not connected")
-        try:
-            stdin, stdout, stderr = self.client.exec_command(command)
-            exit_status = stdout.channel.recv_exit_status()
-            out = stdout.read().decode("utf-8", errors="replace").strip()
-            err = stderr.read().decode("utf-8", errors="replace").strip()
-            return out, err, exit_status
-        except Exception as e:
-            raise RuntimeError(f"Command execution failed: {e}")
-
-    def sftp_upload(self, local_path: Path, remote_path: str) -> bool:
-        try:
-            if not self.sftp:
-                self.sftp = self.client.open_sftp()
-            self.sftp.put(str(local_path), remote_path)
-            return True
-        except Exception as e:
-            raise RuntimeError(f"SFTP upload failed: {e}")
-
-    def sftp_download(self, remote_path: str, local_path: Path) -> bool:
-        try:
-            if not self.sftp:
-                self.sftp = self.client.open_sftp()
-            self.sftp.get(remote_path, str(local_path))
-            return True
-        except Exception as e:
-            raise RuntimeError(f"SFTP download failed: {e}")
-
-    def disconnect(self):
-        if self.sftp:
-            try:
-                self.sftp.close()
-            except Exception:
-                pass
-            self.sftp = None
-        if self.client:
-            try:
-                self.client.close()
-            except Exception:
-                pass
-            self.client = None
-
-    def ping_host(self, host: str, timeout: int = 3) -> Optional[float]:
-        try:
-            start = time.time()
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(timeout)
-            sock.connect((host, 22))
-            sock.close()
-            elapsed = (time.time() - start) * 1000
-            return elapsed
-        except Exception:
-            return None
-
-    def list_available_ports(self) -> List[dict]:
-        """List available serial ports on remote device with descriptions"""
-        if not self.client:
-            raise RuntimeError("Not connected")
-        try:
-            # Get list of serial ports
-            out, _, _ = self.exec_command("ls -1 /dev/tty* 2>/dev/null | grep -E '(ttyUSB|ttyACM|ttyS|COM)'")
-            ports_list = [p.strip() for p in out.split("\n") if p.strip()]
-            
-            if not ports_list:
-                return []
-            
-            # Enrich with descriptions from sysfs
-            ports_with_info = []
-            for port in ports_list:
-                port_info = {
-                    "path": port,
-                    "name": port.split("/")[-1],  # ttyUSB0, ttyACM0, etc.
-                    "description": "",
-                    "type": "serial"
-                }
-                
-                # Try to get description from different sources
-                # Method 1: Try to read product/manufacturer from sysfs (Linux)
-                if "ttyUSB" in port or "ttyACM" in port:
-                    # Extract port number
-                    port_num = ''.join(c for c in port if c.isdigit())
-                    
-                    # Try udev/sysfs for USB device info
-                    cmds = [
-                        f"cat /sys/class/tty/{port.split('/')[-1]}/device/../product 2>/dev/null",
-                        f"cat /sys/class/tty/{port.split('/')[-1]}/device/../manufacturer 2>/dev/null",
-                        f"lsusb 2>/dev/null | grep -i usb | head -1",
-                    ]
-                    
-                    descriptions = []
-                    for cmd in cmds:
-                        try:
-                            out_desc, _, _ = self.exec_command(cmd)
-                            if out_desc.strip():
-                                descriptions.append(out_desc.strip())
-                        except:
-                            pass
-                    
-                    if descriptions:
-                        port_info["description"] = " - ".join(descriptions[:2])
-                
-                ports_with_info.append(port_info)
-            
-            return ports_with_info
-        except Exception:
-            return []
-
-    def list_available_programmers(self) -> List[dict]:
-        """List available USBasp programmers connected via USB"""
-        if not self.client:
-            raise RuntimeError("Not connected")
-        try:
-            # USBasp vendor:product ID is 16c0:05dc
-            out, _, _ = self.exec_command("lsusb -d 16c0:05dc 2>/dev/null")
-            
-            if not out.strip():
-                return []
-            
-            programmers = []
-            for line in out.split("\n"):
-                if not line.strip():
-                    continue
-                # Parse lsusb output: "Bus 001 Device 005: ID 16c0:05dc Van Ooijen Technische Informatica USBasp"
-                parts = line.split()
-                if len(parts) >= 4:
-                    bus = parts[1]
-                    device = parts[3].rstrip(":")
-                    
-                    prog_info = {
-                        "path": f"usb:{bus}:{device}",
-                        "name": f"USBasp (Bus {bus}, Device {device})",
-                        "description": "Atmel USBasp Programmer",
-                        "type": "usbasp",
-                        "bus": bus,
-                        "device": device
-                    }
-                    programmers.append(prog_info)
-            
-            return programmers
-        except Exception:
-            return []
-
-    def load_port_labels(self, remote_label_file: str) -> dict:
-        """Load port labels from remote file"""
-        if not self.client:
-            return {}
-        try:
-            out, _, code = self.exec_command(f"cat {remote_label_file} 2>/dev/null")
-            if code == 0 and out.strip():
-                return json.loads(out)
-        except Exception:
-            pass
-        return {}
-
-    def save_port_labels(self, labels: dict, remote_label_file: str) -> bool:
-        """Save port labels to remote file"""
-        if not self.client:
-            return False
-        try:
-            import tempfile
-            temp_file = Path(tempfile.gettempdir()) / "port_labels.json"
-            with open(temp_file, "w") as f:
-                json.dump(labels, f, indent=2)
-            
-            # Create directory if needed
-            remote_dir = str(Path(remote_label_file).parent)
-            self.exec_command(f"mkdir -p {remote_dir}")
-            
-            # Upload file
-            self.sftp_upload(temp_file, remote_label_file)
-            temp_file.unlink()
-            return True
-        except Exception:
-            return False
-
-    def _handle_ppk_key(self, ppk_path: str) -> str:
-        ppk_file = Path(ppk_path)
-        if not ppk_file.exists():
-            raise FileNotFoundError(f"PPK key file not found: {ppk_path}")
-
-        try:
-            import subprocess
-            import tempfile
-            import shutil
-
-            puttygen_path = shutil.which("puttygen")
-            if puttygen_path:
-                temp_dir = Path(tempfile.gettempdir())
-                openssh_key = temp_dir / f"{ppk_file.stem}_openssh.pem"
-                commands = [
-                    [puttygen_path, str(ppk_path), "-o", str(openssh_key)],
-                    [puttygen_path, "-O", "private-openssh", "-o", str(openssh_key), str(ppk_path)],
-                ]
-                for cmd in commands:
-                    try:
-                        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-                        if result.returncode == 0 and openssh_key.exists():
-                            return str(openssh_key)
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-
-        raise RuntimeError(
-            "PPK format detected but conversion failed.\n\n"
-            "Convert to OpenSSH format using PuTTYgen:\n"
-            "Conversions → Export OpenSSH key → save as .pem"
-        )
-
-
-# ─── Configuration Manager ────────────────────────────────────────
-class ConfigManager:
-    @staticmethod
-    def load() -> dict:
-        if CONFIG_FILE.exists():
-            with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
-        return ConfigManager._default_config()
-
-    @staticmethod
-    def save(config: dict):
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(config, f, indent=2, default=str)
-
-    @staticmethod
-    def _default_config() -> dict:
-        return {
-            "profiles": [asdict(ConnectionProfile())],
-            "active_profile_idx": 0,
-            "ssh_timeout": 10,
-            "remote_dir": "/tmp",
-            "delete_after_flash": False,
-            "command_history": [],
-            "custom_commands": [
-                "avrdude -p m328p -c usbasp -U flash:w:",
-                "avrdude -p m128 -c usbasp -U flash:w:",
-                "avrdude -p m2560 -c wiring -U flash:w:",
-                "esptool.py write_flash 0x0",
-                "dfu-util -D",
-            ],
-            "last_file_path": None,
-        }
-
-
-# ─── AVR signature database ────────────────────────────────────────
-import re
-
-# Device signature (3 bytes, hex, lowercase) → (avrdude part id, human name)
-AVR_SIGNATURES = {
-    "1e950f": ("m328p", "ATmega328P"),
-    "1e9514": ("m328", "ATmega328"),
-    "1e9516": ("m328pb", "ATmega328PB"),
-    "1e9406": ("m168", "ATmega168"),
-    "1e940b": ("m168p", "ATmega168P"),
-    "1e9307": ("m8", "ATmega8"),
-    "1e9403": ("m16", "ATmega16"),
-    "1e9502": ("m32", "ATmega32"),
-    "1e9602": ("m64", "ATmega64"),
-    "1e9609": ("m644", "ATmega644"),
-    "1e960a": ("m644p", "ATmega644P"),
-    "1e9702": ("m128", "ATmega128"),
-    "1e9703": ("m1280", "ATmega1280"),
-    "1e9704": ("m1281", "ATmega1281"),
-    "1e9705": ("m1284p", "ATmega1284P"),
-    "1e9801": ("m2560", "ATmega2560"),
-    "1e9802": ("m2561", "ATmega2561"),
-    "1e9587": ("m32u4", "ATmega32U4"),
-    "1e9205": ("m48", "ATmega48"),
-    "1e920a": ("m48p", "ATmega48P"),
-    "1e9308": ("m8535", "ATmega8535"),
-    "1e9306": ("m8515", "ATmega8515"),
-    "1e9007": ("t13", "ATtiny13"),
-    "1e910a": ("t2313", "ATtiny2313"),
-    "1e9206": ("t45", "ATtiny45"),
-    "1e930b": ("t85", "ATtiny85"),
-    "1e910b": ("t24", "ATtiny24"),
-    "1e9207": ("t44", "ATtiny44"),
-    "1e930c": ("t84", "ATtiny84"),
-}
-
-SELECT_BG = "#DBEAFE"       # selected row (light blue)
-SELECT_BORDER = BLUE_ACCENT
-DONE_BG = "#DCFCE7"         # green badge background
-
-STEPS = [
-    ("🌐", "Connection", "SSH target device"),
-    ("📁", "Firmware", "File to upload"),
-    ("🎯", "Target", "Port · programmer · chip"),
-    ("⚡", "Flash", "Command & run"),
-]
-
-
-# ─── Sidebar step item ─────────────────────────────────────────────
-class StepItem(tk.Frame):
-    """One entry of the guided-flow sidebar: badge, title, live status."""
-
-    def __init__(self, parent, index, icon, title, on_click):
-        super().__init__(parent, bg=BG_DARK, cursor="hand2")
-        self.index = index
-        self.on_click = on_click
-
-        self.accent = tk.Frame(self, width=3, bg=BG_DARK)
-        self.accent.pack(side="left", fill="y")
-
-        self.body = tk.Frame(self, bg=BG_DARK)
-        self.body.pack(side="left", fill="x", expand=True, padx=(10, 8), pady=10)
-        self.body.columnconfigure(1, weight=1)
-
-        self.badge = tk.Label(self.body, text=str(index + 1), width=2,
-                              font=(FONT_FAMILY, 10, "bold"),
-                              bg=BG_HOVER, fg=TEXT_DIM)
-        self.badge.grid(row=0, column=0, rowspan=2, sticky="n", padx=(0, 9))
-
-        self.title_lbl = tk.Label(self.body, text=f"{icon} {title}",
-                                  font=FONT_SECTION, bg=BG_DARK, fg=TEXT,
-                                  anchor="w")
-        self.title_lbl.grid(row=0, column=1, sticky="w")
-
-        self.sub_lbl = tk.Label(self.body, text="", font=(FONT_FAMILY, 9),
-                                bg=BG_DARK, fg=TEXT_DIM, anchor="w",
-                                justify="left")
-        self.sub_lbl.grid(row=1, column=1, sticky="w")
-
-        for w in (self, self.body, self.badge, self.title_lbl, self.sub_lbl):
-            w.bind("<Button-1>", lambda _e: self.on_click(self.index))
-            w.bind("<Enter>", lambda _e: self._hover(True))
-            w.bind("<Leave>", lambda _e: self._hover(False))
-
-        self._state = "todo"
-        self.set_state("todo", "")
-
-    def _hover(self, on):
-        if self._state == "active":
-            return
-        bg = BG_HOVER if on else BG_DARK
-        for w in (self, self.body, self.title_lbl, self.sub_lbl):
-            w.configure(bg=bg)
-
-    def set_state(self, state, subtitle):
-        """state: 'todo' | 'active' | 'done' (done can also be active)"""
-        self._state = "active" if "active" in state else "todo"
-        active = "active" in state
-        done = "done" in state
-
-        bg = BG_CARD if active else BG_DARK
-        for w in (self, self.body, self.title_lbl, self.sub_lbl):
-            w.configure(bg=bg)
-        self.accent.configure(bg=BLUE_ACCENT if active else bg)
-        self.title_lbl.configure(fg=TEXT_HEADING if active else TEXT)
-
-        if done:
-            self.badge.configure(text="✓", bg=DONE_BG, fg=GREEN_OK)
-        elif active:
-            self.badge.configure(text=str(self.index + 1), bg=BLUE_ACCENT, fg="white")
-        else:
-            self.badge.configure(text=str(self.index + 1), bg=BG_HOVER, fg=TEXT_DIM)
-
-        self.sub_lbl.configure(text=subtitle)
-
-
-# ─── Clickable device list (replaces comboboxes) ───────────────────
-class SelectableList(tk.Frame):
-    """Flat list of clickable rows with hover + selected states."""
-
-    def __init__(self, parent, on_select=None, empty_text="Nothing detected yet"):
-        super().__init__(parent, bg=BG_CARD)
-        self.on_select = on_select
-        self.empty_text = empty_text
-        self.items = []          # dicts: {value, title, subtitle}
-        self.selected_idx = -1
-
-    def set_items(self, items, keep_value=None):
-        self.items = list(items)
-        self.selected_idx = -1
-        if keep_value is not None:
-            for i, it in enumerate(self.items):
-                if it["value"] == keep_value:
-                    self.selected_idx = i
-                    break
-        if self.selected_idx < 0 and self.items:
-            self.selected_idx = 0
-        self._render()
-        if self.on_select and self.selected_idx >= 0:
-            self.on_select(self.items[self.selected_idx]["value"])
-
-    def get(self):
-        if 0 <= self.selected_idx < len(self.items):
-            return self.items[self.selected_idx]["value"]
-        return ""
-
-    def selected_item(self):
-        if 0 <= self.selected_idx < len(self.items):
-            return self.items[self.selected_idx]
-        return None
-
-    def _render(self):
-        for child in self.winfo_children():
-            child.destroy()
-
-        if not self.items:
-            tk.Label(self, text=self.empty_text, bg=BG_CARD, fg=TEXT_DIM,
-                     font=(FONT_FAMILY, 9, "italic"), anchor="w",
-                     pady=6).pack(fill="x")
-            return
-
-        for i, item in enumerate(self.items):
-            selected = (i == self.selected_idx)
-            row = tk.Frame(
-                self, bg=SELECT_BG if selected else BG_CARD2, cursor="hand2",
-                highlightbackground=SELECT_BORDER if selected else BORDER,
-                highlightthickness=1,
-            )
-            row.pack(fill="x", pady=2)
-
-            dot = tk.Label(row, text="◉" if selected else "○",
-                           bg=row["bg"], fg=BLUE_ACCENT if selected else TEXT_DIM,
-                           font=(FONT_FAMILY, 11))
-            dot.pack(side="left", padx=(8, 6), pady=6)
-
-            box = tk.Frame(row, bg=row["bg"])
-            box.pack(side="left", fill="x", expand=True, pady=4)
-            tk.Label(box, text=item["title"], bg=row["bg"],
-                     fg=TEXT_HEADING if selected else TEXT,
-                     font=FONT_BOLD, anchor="w").pack(fill="x")
-            if item.get("subtitle"):
-                tk.Label(box, text=item["subtitle"], bg=row["bg"], fg=TEXT_DIM,
-                         font=(FONT_FAMILY, 8), anchor="w").pack(fill="x")
-
-            widgets = [row, dot, box] + list(box.winfo_children())
-            for w in widgets:
-                w.bind("<Button-1>", lambda _e, idx=i: self._pick(idx))
-                if not selected:
-                    w.bind("<Enter>", lambda _e, r=row: self._paint(r, BG_HOVER))
-                    w.bind("<Leave>", lambda _e, r=row: self._paint(r, BG_CARD2))
-
-    @staticmethod
-    def _paint(row, color):
-        row.configure(bg=color)
-        for child in row.winfo_children():
-            child.configure(bg=color)
-            for sub in child.winfo_children():
-                sub.configure(bg=color)
-
-    def _pick(self, idx):
-        self.selected_idx = idx
-        self._render()
-        if self.on_select:
-            self.on_select(self.items[idx]["value"])
-
-
-# ─── Main Application ─────────────────────────────────────────────
 class RemoteFlashApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -829,120 +186,10 @@ class RemoteFlashApp(tk.Tk):
         except Exception:
             pass
 
-    # ─── Theme ──────────────────────────────────────────────────
-    def _apply_theme(self):
-        import tkinter.font as tkfont
-
-        global FONT_FAMILY, FONT_MONO, FONT_BASE, FONT_BOLD, FONT_TITLE
-        global FONT_SUBTITLE, FONT_SECTION, FONT_BTN
-        available = set(tkfont.families())
-
-        def pick(candidates, fallback):
-            for name in candidates:
-                if name in available:
-                    return name
-            return fallback
-
-        FONT_FAMILY = pick(["Segoe UI", "Inter", "Helvetica Neue", "DejaVu Sans"], "TkDefaultFont")
-        FONT_MONO = pick(["Cascadia Mono", "Consolas", "JetBrains Mono", "Menlo", "DejaVu Sans Mono"], "TkFixedFont")
-        FONT_BASE = (FONT_FAMILY, 10)
-        FONT_BOLD = (FONT_FAMILY, 10, "bold")
-        FONT_TITLE = (FONT_FAMILY, 19, "bold")
-        FONT_SUBTITLE = (FONT_FAMILY, 10)
-        FONT_SECTION = (FONT_FAMILY, 11, "bold")
-        FONT_BTN = (FONT_FAMILY, 11, "bold")
-
-        self.configure(bg=BG_DARK)
-        self.option_add("*TCombobox*Listbox.background", BG_CARD2)
-        self.option_add("*TCombobox*Listbox.foreground", TEXT)
-        self.option_add("*TCombobox*Listbox.selectBackground", BLUE_ACCENT)
-        self.option_add("*TCombobox*Listbox.selectForeground", "white")
-        self.option_add("*TCombobox*Listbox.font", FONT_BASE)
-
-        style = ttk.Style()
-        style.theme_use("clam")
-
-        style.configure(".", background=BG_DARK, foreground=TEXT,
-                        fieldbackground=BG_CARD2, bordercolor=BORDER,
-                        font=FONT_BASE)
-        style.configure("TFrame", background=BG_CARD)
-        style.configure("Root.TFrame", background=BG_DARK)
-        style.configure("Card.TFrame", background=BG_CARD)
-        style.configure("Rule.TFrame", background=BORDER)
-
-        style.configure("TLabel", background=BG_CARD, foreground=TEXT)
-        style.configure("Card.TLabel", background=BG_CARD, foreground=TEXT)
-        style.configure("Section.TLabel", background=BG_CARD,
-                        foreground=TEXT_HEADING, font=FONT_SECTION)
-        style.configure("PanelTitle.TLabel", background=BG_DARK,
-                        foreground=TEXT_HEADING, font=(FONT_FAMILY, 15, "bold"))
-        style.configure("PanelDesc.TLabel", background=BG_DARK,
-                        foreground=TEXT_DIM, font=FONT_SUBTITLE)
-        style.configure("Title.TLabel", background=BG_DARK,
-                        foreground=TEXT_HEADING, font=FONT_TITLE)
-        style.configure("Subtitle.TLabel", background=BG_DARK,
-                        foreground=TEXT_DIM, font=FONT_SUBTITLE)
-        style.configure("Dim.TLabel", background=BG_DARK, foreground=TEXT_DIM)
-        style.configure("CardDim.TLabel", background=BG_CARD, foreground=TEXT_DIM)
-        style.configure("Status.TLabel", background=BG_DARK, font=FONT_BOLD)
-        style.configure("Chip.TLabel", background=DONE_BG, foreground=GREEN_PRESS,
-                        font=FONT_BOLD, padding=(8, 3))
-
-        style.configure("TButton", background=BG_CARD2, foreground=TEXT,
-                        bordercolor=BORDER, focuscolor=BG_CARD,
-                        relief="flat", padding=(10, 6), font=FONT_BASE)
-        style.map("TButton",
-                  background=[("pressed", BG_DARK), ("active", BG_HOVER)],
-                  foreground=[("disabled", TEXT_DIM)],
-                  bordercolor=[("active", BLUE_ACCENT)])
-
-        for el in ("TEntry", "TSpinbox"):
-            style.configure(el, fieldbackground=BG_CARD2, foreground=TEXT,
-                            bordercolor=BORDER, insertcolor=TEXT,
-                            relief="flat", padding=5)
-            style.map(el, bordercolor=[("focus", BORDER_FOCUS)],
-                      lightcolor=[("focus", BORDER_FOCUS)],
-                      darkcolor=[("focus", BORDER_FOCUS)])
-        style.configure("TSpinbox", arrowcolor=TEXT_DIM)
-
-        style.configure("TCombobox", fieldbackground=BG_CARD2, background=BG_CARD2,
-                        foreground=TEXT, arrowcolor=TEXT_DIM, bordercolor=BORDER,
-                        relief="flat", padding=5)
-        style.map("TCombobox",
-                  fieldbackground=[("readonly", BG_CARD2)],
-                  foreground=[("readonly", TEXT)],
-                  bordercolor=[("focus", BORDER_FOCUS), ("active", BLUE_ACCENT)],
-                  arrowcolor=[("active", BLUE_ACCENT)])
-
-        for el in ("TCheckbutton", "TRadiobutton"):
-            style.configure(el, background=BG_CARD, foreground=TEXT,
-                            focuscolor=BG_CARD, indicatorcolor=BG_CARD2,
-                            indicatorbackground=BG_CARD2)
-            style.map(el,
-                      background=[("active", BG_CARD)],
-                      foreground=[("disabled", TEXT_DIM)],
-                      indicatorcolor=[("selected", BLUE_ACCENT),
-                                      ("active", BG_HOVER)])
-
-        style.configure("TLabelframe", background=BG_CARD, bordercolor=BORDER,
-                        relief="solid", borderwidth=1)
-        style.configure("TLabelframe.Label", background=BG_CARD,
-                        foreground=TEXT_HEADING, font=FONT_SECTION)
-
-        for el in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
-            style.configure(el, background=BG_CARD2, troughcolor=BG_DARK,
-                            bordercolor=BG_DARK, arrowcolor=TEXT_DIM,
-                            relief="flat")
-            style.map(el, background=[("active", BG_HOVER)])
-
-        style.configure("Accent.Horizontal.TProgressbar",
-                        troughcolor=BG_CARD2, background=BLUE_ACCENT,
-                        bordercolor=BG_CARD2, lightcolor=BLUE_ACCENT,
-                        darkcolor=BLUE_ACCENT, thickness=6)
-
     # ─── Layout skeleton ────────────────────────────────────────
     def _setup_ui(self):
-        self._apply_theme()
+        theme.apply_theme(self)
+        self._build_menubar()
 
         self.rowconfigure(0, weight=0)   # header
         self.rowconfigure(1, weight=0)   # update banner (hidden by default)
@@ -1001,12 +248,12 @@ class RemoteFlashApp(tk.Tk):
                   style="Subtitle.TLabel").pack(anchor="w")
 
         # Connection pill (right side of header)
-        self.conn_pill = tk.Label(parent, text="● Disconnected", font=FONT_BOLD,
+        self.conn_pill = tk.Label(parent, text="● Disconnected", font=theme.FONT_BOLD,
                                   bg="#FEE2E2", fg=RED_ERR, padx=12, pady=5)
         self.conn_pill.pack(side="right")
 
         # About button
-        about = tk.Label(parent, text="ℹ  About", font=FONT_BASE,
+        about = tk.Label(parent, text="ℹ  About", font=theme.FONT_BASE,
                          bg=BG_DARK, fg=TEXT_DIM, cursor="hand2", padx=10)
         about.pack(side="right", padx=(0, 8))
         about.bind("<Button-1>", lambda _e: self._show_about())
@@ -1070,7 +317,7 @@ class RemoteFlashApp(tk.Tk):
     def _make_action_button(self, parent, text, command, base, hover, press):
         btn = tk.Button(
             parent, text=text, command=command,
-            font=FONT_BTN, bg=base, fg="white",
+            font=theme.FONT_BTN, bg=base, fg="white",
             activebackground=press, activeforeground="white",
             relief="flat", bd=0, cursor="hand2",
             highlightthickness=0,
@@ -1257,7 +504,7 @@ class RemoteFlashApp(tk.Tk):
         chip_row = ttk.Frame(card)
         chip_row.pack(fill="x", pady=(8, 0))
         self.chip_label = tk.Label(chip_row, text="No chip detected yet",
-                                   bg=BG_CARD2, fg=TEXT_DIM, font=FONT_BOLD,
+                                   bg=BG_CARD2, fg=TEXT_DIM, font=theme.FONT_BOLD,
                                    padx=10, pady=5)
         self.chip_label.pack(side="left")
         ttk.Checkbutton(card, text="Adapt avrdude “-p” automatically to the detected chip",
@@ -1293,7 +540,7 @@ class RemoteFlashApp(tk.Tk):
 
         card = self._card(parent, "What will run")
         self.preview_label = tk.Label(
-            card, text="", bg=BG_CARD2, fg="#1D4ED8", font=(FONT_MONO, 9),
+            card, text="", bg=BG_CARD2, fg="#1D4ED8", font=(theme.FONT_MONO, 9),
             anchor="w", justify="left", wraplength=420, padx=10, pady=8)
         self.preview_label.pack(fill="x")
 
@@ -1336,7 +583,7 @@ class RemoteFlashApp(tk.Tk):
             frame, state="disabled", wrap="word",
             bg=BG_CARD2, fg=TEXT, insertbackground=TEXT,
             selectbackground=BLUE_ACCENT, selectforeground="white",
-            font=(FONT_MONO, 10), relief="flat", borderwidth=0,
+            font=(theme.FONT_MONO, 10), relief="flat", borderwidth=0,
             padx=10, pady=8,
         )
         self.log_text.grid(row=1, column=0, sticky="nsew")
@@ -1370,6 +617,19 @@ class RemoteFlashApp(tk.Tk):
         self.ping_label = ttk.Label(bar, text="", style="Dim.TLabel")
         self.ping_label.pack(side="right", padx=8)
 
+    # ─── Menu bar ────────────────────────────────
+    def _build_menubar(self):
+        """Top menu bar: File → Check for Updates / Exit."""
+        menubar = tk.Menu(self)
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(
+            label="Check for Updates…",
+            command=lambda: self._check_updates_async(manual=True))
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.on_closing)
+        menubar.add_cascade(label="File", menu=file_menu)
+        self.config(menu=menubar)
+
     # ─── About dialog ───────────────────────────────────────────
     def _show_about(self):
         dialog = tk.Toplevel(self)
@@ -1380,13 +640,13 @@ class RemoteFlashApp(tk.Tk):
         dialog.grab_set()
         dialog.configure(bg=BG_CARD)
 
-        tk.Label(dialog, text="⚡", font=(FONT_FAMILY, 28), bg=BG_CARD,
+        tk.Label(dialog, text="⚡", font=(theme.FONT_FAMILY, 28), bg=BG_CARD,
                  fg=BLUE_ACCENT).pack(pady=(18, 0))
-        tk.Label(dialog, text=APP_NAME, font=(FONT_FAMILY, 16, "bold"),
+        tk.Label(dialog, text=APP_NAME, font=(theme.FONT_FAMILY, 16, "bold"),
                  bg=BG_CARD, fg=TEXT_HEADING).pack()
-        tk.Label(dialog, text=f"Version {APP_VERSION}", font=FONT_BASE,
+        tk.Label(dialog, text=f"Version {APP_VERSION}", font=theme.FONT_BASE,
                  bg=BG_CARD, fg=TEXT_DIM).pack()
-        tk.Label(dialog, text=APP_TAGLINE, font=FONT_BASE,
+        tk.Label(dialog, text=APP_TAGLINE, font=theme.FONT_BASE,
                  bg=BG_CARD, fg=TEXT).pack(pady=(2, 12))
 
         tk.Frame(dialog, bg=BORDER, height=1).pack(fill="x", padx=24)
@@ -1397,9 +657,9 @@ class RemoteFlashApp(tk.Tk):
         def _row(label, value, url=None):
             r = tk.Frame(info, bg=BG_CARD)
             r.pack(anchor="w", pady=2)
-            tk.Label(r, text=label, font=FONT_BOLD, bg=BG_CARD,
+            tk.Label(r, text=label, font=theme.FONT_BOLD, bg=BG_CARD,
                      fg=TEXT, width=9, anchor="w").pack(side="left")
-            lbl = tk.Label(r, text=value, font=FONT_BASE, bg=BG_CARD,
+            lbl = tk.Label(r, text=value, font=theme.FONT_BASE, bg=BG_CARD,
                            fg=BLUE_ACCENT if url else TEXT,
                            cursor="hand2" if url else "arrow")
             lbl.pack(side="left")
@@ -1412,7 +672,7 @@ class RemoteFlashApp(tk.Tk):
         _row("GitHub", GITHUB_REPO, GITHUB_URL)
 
         tk.Label(dialog, text=f"© 2026 {APP_PUBLISHER} — All rights reserved",
-                 font=(FONT_FAMILY, 8), bg=BG_CARD, fg=TEXT_DIM).pack(pady=(4, 0))
+                 font=(theme.FONT_FAMILY, 8), bg=BG_CARD, fg=TEXT_DIM).pack(pady=(4, 0))
 
         ttk.Button(dialog, text="Close", command=dialog.destroy,
                    width=10).pack(pady=10)
@@ -1428,11 +688,11 @@ class RemoteFlashApp(tk.Tk):
         inner.pack(fill="x", padx=12, pady=7)
 
         self.update_label = tk.Label(inner, text="", bg=SELECT_BG,
-                                     fg=TEXT_HEADING, font=FONT_BOLD)
+                                     fg=TEXT_HEADING, font=theme.FONT_BOLD)
         self.update_label.pack(side="left")
 
         dismiss = tk.Label(inner, text="✕", bg=SELECT_BG, fg=TEXT_DIM,
-                           font=FONT_BOLD, cursor="hand2", padx=6)
+                           font=theme.FONT_BOLD, cursor="hand2", padx=6)
         dismiss.pack(side="right")
         dismiss.bind("<Button-1>", lambda _e: self.update_banner.grid_remove())
 
@@ -1457,10 +717,11 @@ class RemoteFlashApp(tk.Tk):
         nums = [int(n) for n in re.findall(r"\d+", v)[:4]]
         return tuple(nums + [0] * (4 - len(nums)))
 
-    def _check_updates_async(self):
-        threading.Thread(target=self._check_updates_worker, daemon=True).start()
+    def _check_updates_async(self, manual=False):
+        threading.Thread(target=lambda: self._check_updates_worker(manual),
+                         daemon=True).start()
 
-    def _check_updates_worker(self):
+    def _check_updates_worker(self, manual=False):
         try:
             req = urllib.request.Request(
                 GITHUB_API_LATEST,
@@ -1474,6 +735,10 @@ class RemoteFlashApp(tk.Tk):
                 return
             if self._version_tuple(tag) <= self._version_tuple(APP_VERSION):
                 self._add_log(LogLevel.Debug, f"Up to date (v{APP_VERSION}).")
+                if manual:
+                    self._ui(lambda: messagebox.showinfo(
+                        "No updates",
+                        f"You're running the latest version (v{APP_VERSION})."))
                 return
 
             self.latest_version = tag
@@ -1493,8 +758,12 @@ class RemoteFlashApp(tk.Tk):
                           f"Update available: v{tag} (current: v{APP_VERSION})")
             self._ui(self._show_update_banner)
         except Exception as e:
-            # Offline / rate-limited / no releases yet — never bother the user
+            # Offline / rate-limited / no releases yet — stay quiet unless asked
             self._add_log(LogLevel.Debug, f"Update check skipped: {e}")
+            if manual:
+                self._ui(lambda: messagebox.showwarning(
+                    "Update check failed",
+                    f"Could not check for updates:\n{e}"))
 
     def _download_update(self):
         if not self.update_url:

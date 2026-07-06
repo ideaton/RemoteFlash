@@ -62,7 +62,14 @@ This produces both the installer and the portable exe in `build/Output/`. See [`
 
 ```
 app/
-  app.py            # the whole application (UI + SSH + updater)
+  app.py            # main window + updater (Tk application)
+  constants.py      # app identity + auto-update source
+  theme.py          # colour palette, fonts, ttk styles
+  models.py         # enums + data classes
+  avr_signatures.py # AVR device-signature database
+  ssh_client.py     # pure-Python SSH/SFTP client
+  config_manager.py # JSON config persistence
+  widgets.py        # custom Tk widgets
   requirements.txt
 build/
   build.bat         # PyInstaller + Inno Setup build script
