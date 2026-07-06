@@ -14,7 +14,7 @@ The application is split into focused modules:
     widgets.py         custom Tk widgets
     app.py             main window + updater (this file)
 
-Version: 1.2.0 · © IDEATON
+Version: 1.2.1 · © IDEATON
 """
 
 import os
@@ -94,6 +94,7 @@ class RemoteFlashApp(tk.Tk):
         self.update_url: Optional[str] = None
         self.update_asset_name: Optional[str] = None
         self.release_page: Optional[str] = None
+        self.update_kind: str = "portable"   # "installer" | "portable"
 
         # UI Variables
         self.custom_commands = self.config_data.get("custom_commands", [])
@@ -717,6 +718,50 @@ class RemoteFlashApp(tk.Tk):
         nums = [int(n) for n in re.findall(r"\d+", v)[:4]]
         return tuple(nums + [0] * (4 - len(nums)))
 
+    def _install_kind(self) -> str:
+        """Return "installer" if this copy was put in place by the Setup, else
+        "portable". Both builds are the same .exe, so we can't tell them apart
+        at compile time — we detect it at runtime instead."""
+        # Only a frozen (PyInstaller) build can be an installed copy.
+        if not getattr(sys, "frozen", False):
+            return "portable"
+        try:
+            exe_dir = Path(sys.executable).resolve().parent
+        except Exception:
+            return "portable"
+
+        # 1) The installer writes its location to HKCU — match it to this exe.
+        reg_dir = self._registry_install_path()
+        if reg_dir is not None:
+            try:
+                if reg_dir.resolve() == exe_dir:
+                    return "installer"
+            except Exception:
+                pass
+
+        # 2) Fallback: the default per-user install dir.
+        localapp = os.environ.get("LOCALAPPDATA", "")
+        if localapp:
+            default_dir = Path(localapp) / "Programs" / "RemoteFlash"
+            try:
+                if default_dir.resolve() == exe_dir:
+                    return "installer"
+            except Exception:
+                pass
+        return "portable"
+
+    @staticmethod
+    def _registry_install_path() -> Optional[Path]:
+        """Path recorded by the installer under HKCU (Windows only)."""
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\IDEATON\RemoteFlash") as key:
+                value, _ = winreg.QueryValueEx(key, "InstallPath")
+                return Path(value)
+        except Exception:
+            return None
+
     def _check_updates_async(self, manual=False):
         threading.Thread(target=lambda: self._check_updates_worker(manual),
                          daemon=True).start()
@@ -744,18 +789,32 @@ class RemoteFlashApp(tk.Tk):
             self.latest_version = tag
             self.release_page = (data.get("html_url")
                                  or f"https://github.com/{GITHUB_REPO}/releases/latest")
-            # Prefer the installer asset ("…Setup….exe"); fall back to any .exe
+
+            # Pick the asset that matches how THIS copy is running:
+            #   installed build → the "…Setup….exe" installer
+            #   portable build  → the "…Portable….exe" single-file exe
+            # Fall back to the other .exe, then to any .exe.
+            self.update_kind = self._install_kind()
             exe_assets = [a for a in data.get("assets", [])
                           if a.get("name", "").lower().endswith(".exe")]
-            chosen = next((a for a in exe_assets
-                           if "setup" in a.get("name", "").lower()),
-                          exe_assets[0] if exe_assets else None)
+
+            def _match(keyword):
+                return next((a for a in exe_assets
+                             if keyword in a.get("name", "").lower()), None)
+
+            if self.update_kind == "installer":
+                chosen = _match("setup") or _match("portable")
+            else:
+                chosen = _match("portable") or _match("setup")
+            chosen = chosen or (exe_assets[0] if exe_assets else None)
+
             if chosen:
                 self.update_url = chosen.get("browser_download_url")
                 self.update_asset_name = chosen.get("name")
 
             self._add_log(LogLevel.Info,
-                          f"Update available: v{tag} (current: v{APP_VERSION})")
+                          f"Update available: v{tag} (current: v{APP_VERSION}) "
+                          f"— {self.update_kind} build")
             self._ui(self._show_update_banner)
         except Exception as e:
             # Offline / rate-limited / no releases yet — stay quiet unless asked
@@ -811,10 +870,15 @@ class RemoteFlashApp(tk.Tk):
 
     def _prompt_install_update(self, dest: Path):
         self.btn_update.config(text="✓  Downloaded")
-        if messagebox.askyesno(
-                "Update ready",
-                f"{dest.name} has been downloaded.\n\n"
-                f"Run the installer now? {APP_NAME} will close."):
+        if self.update_kind == "installer":
+            question = (f"{dest.name} has been downloaded.\n\n"
+                        f"Run the installer now? {APP_NAME} will close and "
+                        f"reopen updated.")
+        else:
+            question = (f"{dest.name} has been downloaded.\n\n"
+                        f"Launch the new version now? This copy will close.\n"
+                        f"(You can delete the old .exe afterwards.)")
+        if messagebox.askyesno("Update ready", question):
             try:
                 os.startfile(dest)              # Windows
             except AttributeError:              # non-Windows fallback
